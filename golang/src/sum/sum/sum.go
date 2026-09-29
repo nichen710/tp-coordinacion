@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -82,6 +85,8 @@ func NewSum(config SumConfig) (*Sum, error) {
 }
 
 func (sum *Sum) Run() {
+	go sum.handleSignals()
+
 	if sum.sumAmount > 1 {
 		go sum.controlExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 			defer ack()
@@ -205,4 +210,18 @@ func hashFruit(fruit string) uint32 {
 	h := fnv.New32a()
 	h.Write([]byte(fruit))
 	return h.Sum32()
+}
+
+func (sum *Sum) handleSignals() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	<-signals
+	slog.Info("SIGTERM signal received")
+	sum.inputQueue.Close()
+	if sum.controlExchange != nil {
+		sum.controlExchange.Close()
+	}
+	for _, ex := range sum.aggregationExchanges {
+		ex.Close()
+	}
 }
