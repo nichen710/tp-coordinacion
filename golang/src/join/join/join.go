@@ -26,8 +26,8 @@ type Join struct {
 	outputQueue       middleware.Middleware
 	topSize           int
 	aggregationAmount int
-	fruitItemMap      map[string]fruititem.FruitItem
-	eofCount          int
+	fruitItemMap      map[string]map[string]fruititem.FruitItem
+	eofCount          map[string]int
 }
 
 func NewJoin(config JoinConfig) (*Join, error) {
@@ -49,8 +49,8 @@ func NewJoin(config JoinConfig) (*Join, error) {
 		outputQueue:       outputQueue,
 		topSize:           config.TopSize,
 		aggregationAmount: config.AggregationAmount,
-		fruitItemMap:      map[string]fruititem.FruitItem{},
-		eofCount:          0,
+		fruitItemMap:      map[string]map[string]fruititem.FruitItem{},
+		eofCount:          map[string]int{},
 	}, nil
 }
 
@@ -63,36 +63,43 @@ func (join *Join) Run() {
 func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	defer ack()
 
-	fruitRecords, isEof, err := inner.DeserializeMessage(&msg)
+	innerMsg, err := inner.DeserializeMessage(&msg)
 	if err != nil {
 		slog.Error("While deserializing message in join", "err", err)
 		return
 	}
 
-	if isEof {
-		join.eofCount++
-		if join.eofCount >= join.aggregationAmount {
-			if err := join.sendFinalTop(); err != nil {
+	if innerMsg.IsEof {
+		join.eofCount[innerMsg.ClientID]++
+		if join.eofCount[innerMsg.ClientID] >= join.aggregationAmount {
+			if err := join.sendFinalTop(innerMsg.ClientID); err != nil {
 				slog.Error("While sending final top", "err", err)
 			}
-			join.fruitItemMap = map[string]fruititem.FruitItem{}
-			join.eofCount = 0
+			delete(join.fruitItemMap, innerMsg.ClientID)
+			delete(join.eofCount, innerMsg.ClientID)
 		}
 		return
 	}
 
-	for _, fruitRecord := range fruitRecords {
-		if _, ok := join.fruitItemMap[fruitRecord.Fruit]; ok {
-			join.fruitItemMap[fruitRecord.Fruit] = join.fruitItemMap[fruitRecord.Fruit].Sum(fruitRecord)
+	clientFruits, ok := join.fruitItemMap[innerMsg.ClientID]
+	if !ok {
+		clientFruits = make(map[string]fruititem.FruitItem)
+		join.fruitItemMap[innerMsg.ClientID] = clientFruits
+	}
+
+	for _, fruitRecord := range innerMsg.Records {
+		if _, ok := clientFruits[fruitRecord.Fruit]; ok {
+			clientFruits[fruitRecord.Fruit] = clientFruits[fruitRecord.Fruit].Sum(fruitRecord)
 		} else {
-			join.fruitItemMap[fruitRecord.Fruit] = fruitRecord
+			clientFruits[fruitRecord.Fruit] = fruitRecord
 		}
 	}
 }
 
-func (join *Join) sendFinalTop() error {
-	fruitItems := make([]fruititem.FruitItem, 0, len(join.fruitItemMap))
-	for _, item := range join.fruitItemMap {
+func (join *Join) sendFinalTop(clientID string) error {
+	clientFruits := join.fruitItemMap[clientID]
+	fruitItems := make([]fruititem.FruitItem, 0, len(clientFruits))
+	for _, item := range clientFruits {
 		fruitItems = append(fruitItems, item)
 	}
 	sort.SliceStable(fruitItems, func(i, j int) bool {
@@ -101,7 +108,11 @@ func (join *Join) sendFinalTop() error {
 	finalTopSize := min(join.topSize, len(fruitItems))
 	finalTop := fruitItems[:finalTopSize]
 
-	message, err := inner.SerializeMessage(finalTop)
+	message, err := inner.SerializeMessage(inner.InnerMessage{
+		ClientID: clientID,
+		Records:  finalTop,
+		IsEof:    false,
+	})
 	if err != nil {
 		return err
 	}
